@@ -50,13 +50,12 @@
 #endif
 
 // convenience masks
-#define UPDOWN_MASK 0b10000000
-#define X_MASK      0b00000111
-#define Y_MASK      0b01111000
-#define MAP_MASK    0b01111111
+#define UPDOWN_MASK  0b10000000
+#define MAP_MASK     0b01111111
+#define FN_SCAN_IDX  34
 
 // ping keyboard if idle for this many milliseconds (keyboard auto-sleeps after 10 minutes)
-#define TIMEOUT 5000
+#define TIMEOUT 30000
 
 // macro for testing if a char is printable ASCII
 #define PRINTABLE_CHAR(x) (((x) >= 32) && ((x) <= 126))
@@ -111,13 +110,11 @@ const uint8_t fn_key_map[128] PROGMEM = {
   /* --- */ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
 };
 
-char last_byte = 0;
-char key_byte = 0;
+uint8_t last_byte = 0;
 
-int fn_key_down = 0;
+bool fn_key_down = false;
 
 unsigned long last_comm = 0;
-int key_count = 0;
 
 #if PPK_DEBUG
 /**
@@ -181,9 +178,8 @@ void print_keychange(uint8_t key_byte, uint8_t key_code, int key_up) {
  * to 500 ms for the two-byte keyboard ID (0xFA 0xFD).  Any additional bytes
  * received alongside the ID (e.g. keys held at check time) are discarded.
  *
- * This function is used both to prevent the keyboard from entering automatic
- * low-power mode (idle path) and to detect physical disconnection (key-repeat
- * path).
+ * Called on the idle path to prevent the keyboard from entering automatic
+ * low-power mode and to detect physical disconnection.
  *
  * @return true   Keyboard responded with the correct ID -- still attached.
  * @return false  No valid response within 500 ms -- keyboard detached or
@@ -193,24 +189,26 @@ bool check_keyboard() {
   while (keyboard_serial.available()) keyboard_serial.read();
 
   digitalWrite(RTS_PIN, LOW);
-  delay(10);
+  delay(200);
+  while (keyboard_serial.available()) keyboard_serial.read();
   digitalWrite(RTS_PIN, HIGH);
 
+  // scan for FA FD — stray key-code bytes may precede the ID if a key was
+  // mid-transmission when the buffer was flushed above
   unsigned long start = millis();
-  while (keyboard_serial.available() < 2) {
-    if (millis() - start > 500) {
-      return false;
+  int prev = -1;
+  while (millis() - start < 500) {
+    if (keyboard_serial.available()) {
+      int b = keyboard_serial.read();
+      if (prev == 0xFA && b == 0xFD) {
+        delay(10);
+        while (keyboard_serial.available()) keyboard_serial.read();
+        return true;
+      }
+      prev = b;
     }
   }
-
-  int b1 = keyboard_serial.read();
-  int b2 = keyboard_serial.read();
-
-  // discard any key codes sent with the ID (keys held at check time)
-  delay(10);
-  while (keyboard_serial.available()) keyboard_serial.read();
-
-  return (b1 == 0xFA) && (b2 == 0xFD);
+  return false;
 }
 
 /**
@@ -218,73 +216,95 @@ bool check_keyboard() {
  *
  * Powers the keyboard by raising VCC_PIN, waits for the DCD line to assert,
  * completes the RTS handshake (raise if low, toggle if already high), and
- * verifies the two-byte keyboard ID (0xFA 0xFD) on the serial line.  Halts
- * in an infinite loop if the ID is not received.
+ * verifies the two-byte keyboard ID (0xFA 0xFD) on the serial line.  Retries
+ * the full power-cycle sequence until the correct ID is received.
  *
  * @note This function blocks until the keyboard responds.  On success,
  *       last_comm is set to the current time so the idle timeout starts fresh.
  */
 void boot_keyboard() {
-  if (PPK_DEBUG) {
-    // delay for a bit to allow for opening serial monitor etc.
-    for (int i = 0; i < 15; delay(1000 + i++)) Serial.print(".");
+  if (PPK_DEBUG) Serial.println("beginning keyboard boot sequence");
 
-    Serial.println("beginning keyboard boot sequence");
-  }
+  bool booted = false;
+  while (!booted) {
+    pinMode(VCC_PIN, OUTPUT);
+    pinMode(GND_PIN, OUTPUT);
+    pinMode(PULLDOWN_PIN, OUTPUT);
 
-  pinMode(VCC_PIN, OUTPUT);
-  pinMode(GND_PIN, OUTPUT);
-  pinMode(PULLDOWN_PIN, OUTPUT);
+    pinMode(RX_PIN, INPUT_PULLUP);
+    pinMode(DCD_PIN, INPUT);
+    pinMode(RTS_PIN, INPUT);
 
-  pinMode(RX_PIN, INPUT_PULLUP);
-  pinMode(DCD_PIN, INPUT);
-  pinMode(RTS_PIN, INPUT);
+    digitalWrite(VCC_PIN, LOW);
+    digitalWrite(GND_PIN, LOW);
+    digitalWrite(PULLDOWN_PIN, LOW);
+    delay(200);
+    digitalWrite(VCC_PIN, HIGH);
+    delay(100);
 
-  digitalWrite(VCC_PIN, LOW);
-  digitalWrite(GND_PIN, LOW);
-  digitalWrite(PULLDOWN_PIN, LOW);
-  digitalWrite(VCC_PIN, HIGH);
+    keyboard_serial.begin(9600);
+    keyboard_serial.listen();
 
-  keyboard_serial.begin(9600);
-  keyboard_serial.listen();
+    if (PPK_DEBUG) Serial.print("waiting for keyboard response...");
 
-  if (PPK_DEBUG) Serial.print("waiting for keyboard response...");
+    unsigned long start = millis();
+    while (digitalRead(DCD_PIN) != HIGH) {
+      if (millis() - start > 3000) break;
+    }
+    if (digitalRead(DCD_PIN) != HIGH) {
+      if (PPK_DEBUG) Serial.println(" timeout, retrying");
+      continue;
+    }
 
-  while (digitalRead(DCD_PIN) != HIGH) {;};
+    if (PPK_DEBUG) Serial.println(" done");
 
-  if (PPK_DEBUG) Serial.println(" done");
+    if (PPK_DEBUG) Serial.print("finishing handshake...");
 
-  if (PPK_DEBUG) Serial.print("finishing handshake...");
+    if (digitalRead(RTS_PIN) == LOW) {
+      delay(10);
+      pinMode(RTS_PIN, OUTPUT);
+      digitalWrite(RTS_PIN, HIGH);
+    } else {
+      pinMode(RTS_PIN, OUTPUT);
+      digitalWrite(RTS_PIN, HIGH);
+      digitalWrite(RTS_PIN, LOW);
+      delay(10);
+      digitalWrite(RTS_PIN, HIGH);
+    }
 
-  if (digitalRead(RTS_PIN) == LOW) {
-    delay(10);
-    pinMode(RTS_PIN, OUTPUT);
-    digitalWrite(RTS_PIN, HIGH);
-  } else {
-    pinMode(RTS_PIN, OUTPUT);
-    digitalWrite(RTS_PIN, HIGH);
-    digitalWrite(RTS_PIN, LOW);
-    delay(10);
-    digitalWrite(RTS_PIN, HIGH);
-  }
+    delay(5);
 
-  delay(5);
+    if (PPK_DEBUG) Serial.println(" done");
 
-  if (PPK_DEBUG) Serial.println(" done");
+    if (PPK_DEBUG) Serial.print("waiting for keyboard serial ID...");
 
-  if (PPK_DEBUG) Serial.print("waiting for keyboard serial ID...");
+    start = millis();
+    while (keyboard_serial.available() < 2) {
+      if (millis() - start > 3000) break;
+    }
+    if (keyboard_serial.available() < 2) {
+      if (PPK_DEBUG) Serial.println(" timeout, retrying");
+      continue;
+    }
 
-  while (keyboard_serial.available() < 2) {;};
+    if (PPK_DEBUG) Serial.println(" done");
 
-  if (PPK_DEBUG) Serial.println(" done");
+    int byte1 = keyboard_serial.read();
+    int byte2 = keyboard_serial.read();
 
-  int byte1 = keyboard_serial.read();
-  int byte2 = keyboard_serial.read();
+    if (PPK_DEBUG) {
+      Serial.print("received ID: 0x");
+      Serial.print(byte1, HEX);
+      Serial.print(" 0x");
+      Serial.println(byte2, HEX);
+    }
 
-  if (!((byte1 == 0xFA) && (byte2 == 0xFD))) {
-    if (PPK_DEBUG) Serial.println("got wrong bytes? giving up here");
+    if (!((byte1 == 0xFA) && (byte2 == 0xFD))) {
+      if (PPK_DEBUG) Serial.println("got wrong bytes, retrying");
+      continue;
+    }
 
-    while (1) {;};
+    booted = true;
   }
 
   last_comm = millis();
@@ -318,9 +338,6 @@ void setup() {
  * or Fn layer).  A duplicate key-up byte (Last Key Up protocol) causes all
  * keys to be released.
  *
- * After every 10 key events, and when the serial buffer is idle, calls
- * check_keyboard() to detect physical disconnection.
- *
  * When no serial data has been received for TIMEOUT milliseconds, calls
  * check_keyboard() to prevent the keyboard from entering automatic low-power
  * mode.  A full power-cycle is performed only if check_keyboard() fails.
@@ -328,7 +345,7 @@ void setup() {
 void loop() {
   if (keyboard_serial.available()) {
     while (keyboard_serial.available()) {
-      key_byte = keyboard_serial.read();
+      uint8_t key_byte = keyboard_serial.read();
 
       bool key_up = key_byte & UPDOWN_MASK;
       uint8_t idx = key_byte & MAP_MASK;
@@ -351,7 +368,7 @@ void loop() {
           }
         } else {
           // special case the Fn key
-          if (idx == 34) {
+          if (idx == FN_SCAN_IDX) {
             fn_key_down = !key_up;
           }
         }
@@ -359,18 +376,6 @@ void loop() {
 
       last_byte = key_byte;
       last_comm = millis();
-      key_count++;
-    }
-    if (key_count >= 10 && !keyboard_serial.available()) {
-      key_count = 0;
-      if (!check_keyboard()) {
-        if (PPK_DEBUG) Serial.println("keyboard detached");
-        Keyboard.releaseAll();
-        digitalWrite(VCC_PIN, LOW);
-        boot_keyboard();
-      } else {
-        last_comm = millis();
-      }
     }
   } else {
     // ping keyboard to prevent auto-sleep and detect detachment
@@ -379,6 +384,7 @@ void loop() {
       if (!check_keyboard()) {
         if (PPK_DEBUG) Serial.println("keyboard not responding, power cycling");
         Keyboard.releaseAll();
+        digitalWrite(RTS_PIN, LOW);
         digitalWrite(VCC_PIN, LOW);
         boot_keyboard();
       } else {
